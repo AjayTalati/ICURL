@@ -1,0 +1,31 @@
+
+3D plot of state space
+
+
+%% 3D plot of state space
+ 
+prop=0.2;
+N=size(Xx,1); %total number of rows to choose from
+sampl=Xx(find(floor(rand(N,1)+prop)),:);
+% following built in funcion is 10x FASTER than kmeanspp.
+[~,C] = kmeans(sampl,750,'Options',options,'MaxIter',10000,...
+    'Start','plus','Display','final','Replicates',4); % only 4 replicates to save time. ran in parallel by 4 of my cores.
+[idx]=fastknnsearch(Xx,C,1);  %N-D nearest point search: look for points closest to each centroid
+toc   
+ 
+[coeff,score,~,~,explained,~] = pca(C);
+ 
+r=array2table([idx Y90]);  % WATCH OUT / I'm not using all models here!! 
+ 
+r.Properties.VariableNames = {'id','morta'};
+d=grpstats(r,'id',{'mean','sum'});
+ 
+ 
+colorbar
+colormap jet
+ 
+% find(score(:,2)>=0.01614 & score(:,2)<0.01615)
+scatter3(score(:,1),score(:,2),score(:,3),d.GroupCount./2,d.mean_morta,'filled')
+ 
+
+
