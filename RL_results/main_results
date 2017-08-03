@@ -1,7 +1,5 @@
 
-3D plot of state space
-
-
+%% ################################################################################################################################## 
 %% 3D plot of state space
  
 prop=0.2;
@@ -24,8 +22,492 @@ d=grpstats(r,'id',{'mean','sum'});
 colorbar
 colormap jet
  
-% find(score(:,2)>=0.01614 & score(:,2)<0.01615)
 scatter3(score(:,1),score(:,2),score(:,3),d.GroupCount./2,d.mean_morta,'filled')
  
+ 
+ 
+%% ##################################################################################################################################
+%% Stats of value of policies
+
+sum(rectest(:,3)>=rectest(:,2))/size(Xtestraw,1)  %overall QVI
+sum(rectest(:,13)>=rectest(:,2))/size(Xtestraw,1)  %overall QVI
+ 
+[quantile(rectest(:,2),0.25) quantile(rectest(:,2),0.5) quantile(rectest(:,2),0.75)]
+[quantile(rectest(:,13),0.25) quantile(rectest(:,13),0.5) quantile(rectest(:,13),0.75)]
+ 
+
+
+%% ##################################################################################################################################
+%% Stats given vs reco doses 
+
+% similar dose norad if given is withing +/- 10% of reco or 0.02 mkm or 10 ml/h
+ 
+rectest(:,9)= rectest(:,4)- rectest(:,5);  %given  - reco  VASOPRESSORS
+rectest(:,10)= rectest(:,6)- rectest(:,7);  %FLUIDS
+ 
+j=abs((rectest(:,4)-rectest(:,5))./(rectest(:,4))).*100;% PCT difference btw given and reco  VASOPRESSORS
+ 
+rectest(:,17)=abs(rectest(:,9))<=0.02| j<=10;   %close dose
+ii=rectest(:,17)==1;   
+rectest(ii,17)=rectest(ii,17)+1;% category 2 = dose similar
+ii=rectest(:,17)==0 & rectest(:,9)<0;%less than reco
+rectest(ii,17)=1;% category 1
+ii=rectest(:,17)==0 & rectest(:,9)>0; %more than reco
+rectest(ii,17)=3;% category 3
+ 
+% stats for all 3 categories
+a=[];
+for i=1:3
+    ii=rectest(:,17)==i;   %rows in rectest who corresp to this category
+    j=rectest(ii,9);   %dose
+ 
+a=[a;    [sum(ii)/numel(ii) mean(rectest(ii,8)) std(rectest(ii,8))./sqrt(sum(ii)) quantile(j,0.25) median(j) quantile(j,0.75)]];
+end
+a(1,1)/(a(1,1)+a(3,1))
+ 
+j= abs((rectest(:,6)-rectest(:,7))./(rectest(:,6))).*100;% PCT difference btw given and reco FLUIDS
+rectest(:,18)=j<=10| abs(rectest(:,10))<=40;   %close dose (40 ml/4h = 10 ml / h)
+ii=rectest(:,18)==1;   
+
+rectest(ii,18)=rectest(ii,18)+1;   % category 2 = dose similar
+ii=rectest(:,18)==0 & rectest(:,10)<0;%less than reco
+rectest(ii,18)=1;  %cat 1
+ii=rectest(:,18)==0 & rectest(:,10)>0; %more than reco
+rectest(ii,18)=3;   % cat 3
+ 
+% stats for all 3 categories
+for i=1:3
+    ii=rectest(:,18)==i;   %rows in rectest who corresp to this category
+    j=rectest(ii,10)./4;   %dose in ml/h
+ 
+a=[a;    [sum(ii)/numel(ii) mean(rectest(ii,8)) std(rectest(ii,8))./sqrt(sum(ii)) quantile(j,0.25) median(j) quantile(j,0.75)]];
+end
+
+a(6,1)/(a(4,1)+a(6,1))
+ 
+%% ##################################################################################################################################
+%% Plot Q values vs mortality - I use training set as the scale.
+ 
+nbins=500;
+ ii=prog(:,3)<500;  %select only NRA = 5
+a=prog(ii,1);  %Q values of actual actions
+qv=floor((a+100)/(200/nbins))+1;  % converts Q values to integers btw 0 and nbins
+ m=prog(ii,2);  %outcome
+h=zeros(nbins,5);  %avg mortality and other results, per bin
+ 
+for i=1:nbins
+    i
+    ii=qv==i;
+    h(i,1)=nanmean(m(ii));  %mean mortality in this bin
+    if numel(m(ii))>0
+     h(i,5)=nanmean(a(ii));  %record the mean of Q values in the bin (to make sure it matches what I expect)
+    end
+    h(i,2)=std(m(ii))/sqrt(numel(m(ii)));  %SEM of mortality in this bin
+    h(i,3)=numel(m(ii));  %nb of data points in this bin
+end
+ 
+%weighted average!!
+h(:,4)=h(:,1).*h(:,3)./numel(qv);
+[nansum(h(:,4)) mean(prog(:,2))] %check that both are close!
+ 
+yy1=smooth(1:nbins,h(:,1),0.025,'rloess');
+figure
+hold on
+line([0 nbins], [0.5 0.5], 'LineStyle',':','color','k');
+line([nbins/2 nbins/2], [0 1], 'LineStyle',':','color','k');
+ 
+H=shadedErrorBar(1:nbins,h(:,1),1.*h(:,2),'-b',2);
+ 
+ylabel('Mortality risk');% (Mean \pm SEM)'); 
+xlabel('Q value')
+axis([0 nbins 0 1]); ax=gca;
+ 
+ax.XTick=0:nbins/10:nbins; ax.XTickLabel =num2cell(-100:20:100);
+ 
+med1=nanmedian(prog(:,1));  %median Q actual
+med2=nanmedian(rectest(:,3));   %median Q optimal
+ 
+bw=0.5*200/nbins;
+ 
+H=plot(yy1,'r','linewidth',2);
+axis square
+hold off
+
+
+%% ##################################################################################################################################
+%% Mortality prediction from Q values in eICU-RI
+ 
+%% Computes avg Q value per patient
+  
+r=array2table([validnan.patientunitstayid rectest(:,[2 13 8])]);
+r.Properties.VariableNames = {'id','Qoff','Qon','morta'};
+d=grpstats(r,'id',{'mean','median','sum'});
+ 
+figure
+histogram(d.median_Qoff(d.mean_morta==0),100);%'normalization','probability')
+hold on
+histogram(d.median_Qoff(d.mean_morta==1),100);%'normalization','probability')
+hold off
+ 
+ 
+%% determine min leaf size (auto hyperparam selection tool)
+ 
+r=array2table([validnan.patientunitstayid rectest(:,[2 13 8])]);
+r.Properties.VariableNames = {'id','Qoff','Qon','morta'};
+d=grpstats(r,'id',{'mean','median','sum'});
+ 
+ 
+a=d.mean_Qoff;
+m=d.mean_morta; 
+mean(m)  %avg actual mortality
+grp=floor(10*rand(size(d,1),1)+1)<10;  %selects a random 90% of data for training
+ 
+rng default
+Mdl = fitrtree(a(grp),m(grp),'OptimizeHyperparameters','auto',...
+    'HyperparameterOptimizationOptions',struct('AcquisitionFunctionName',...
+    'expected-improvement-plus'))
+ 
+ 
+%% find best RANDOM FOREST model for morta prediction
+% best auc among 1000 models (takes ~ 1h)
+ 
+% best =     0.1777    0.0960    0.0782    0.0817    0.0852   
+aucmax=0;  % 0.7465
+a=d.mean_Qoff;
+m=d.mean_morta; 
+mean(m)  %avg actual mortality
+ 
+ 
+for i=1:1000
+    
+       fprintf('##############   Attempt number : ');
+       fprintf('%d \n',i);  
+ 
+grp=floor(10*rand(size(d,1),1)+1)<10;  %selects a random 90% of data for training
+br=TreeBagger(30+floor(200*rand()),a(grp),m(grp),'method','r','OOBVarImp','off','OOBPred','Off','MinLeaf',806);%100+floor(200*rand()) );
+u1=predict(br,a(~grp));
+[~,~,~,AUC] = perfcurve(m(~grp),u1,'1');
+AUC       %performance of predictor
+ 
+if AUC>aucmax
+aucmax=AUC;
+m1=mean(u1);  %predicted with actual actions
+s1=std(u1);
+br2=br;
+u2=predict(br,d.mean_Qon(~grp));   %estimated morta with optimal Q values
+m2=mean(u2);  % predicted with optimal actions
+s2=std(u2);
+ 
+s=sqrt(((numel(u1)-1)*s1^2+(numel(u2)-1)*s2^2)/(numel(u1)+numel(u2)-2));
+ 
+best=[m1 m2 m1-m2-1.96*s*sqrt(1/numel(u1)+1/(numel(u2))) m1-m2 m1-m2+1.96*s*sqrt(1/numel(u1)+1/(numel(u2)))]
+end
+end
+ 
+ 
+%% HL test + plot
+ 
+a=d.median_Qoff;
+m=d.mean_morta;
+ 
+% Hosmer-Lemeshow test  (testing calibration)
+hl=zeros(20,6);
+j=1;
+for i=-50:5:45
+j
+ii=a>i&a<=i+5;
+u=predict(br2,a(ii));  %using the best model found above
+hl(j,1)=i;
+hl(j,2)=sum(ii);
+hl(j,3)=mean(m(ii));
+hl(j,4)=std(m(ii))/sqrt(sum(ii));
+hl(j,5)=mean(u);
+hl(j,6)=std(u)/sqrt(numel(u));
+j=j+1;
+ 
+end
+
+
+   HLstat = sum((hl(:,5) - hl(:,3)).^2./(hl(:,3).*(1-hl(:,3)./hl(:,2))));
+   HLp = 1 - chi2cdf(HLstat,8)  % this is the p statistic of the Chi2
+   % p>0.05 is desirable!!
+
+
+ 
+figure
+h=superbar(hl(:,[3 5]),'e',(hl(:,[4 6])),'BarFaceColor','by');
+legend([h(1) h(21)],{'Actual mortality','Predicted mortality'},'location','ne')
+xlabel('Average Q value per patient')
+ylabel('Mortality (mean \pm SEM)')
+axis([0 21 0 1])
+ax=gca;
+ax.XTick = 1:20
+ax.XTickLabel ={'-50 to -45','-45 to -40','-40 to -35','-35 to -30','-30 to -25','-25 to -20','-20 to -15','-15 to -10','-10 to -5','-5 to 0','0 to 5','5 to 10','10 to 15','15 to 20','20 to 25','25 to 30','30 to 35','35 to 40','40 to 45','45 to 50','','','','',''};% num2cell(-100:20:100);
+rotateXLabels( gca, 45)
+ 
+set(gca,'FontSize',12)
+ 
+
+%% Log regr model
+ 
+a=d.median_Qoff;
+m=d.mean_morta;
+grp=floor(10*rand(size(d,1),1)+1)<10;  %selects a random 90% of data for training
+ 
+% train model on 90% of data
+B = glmfit(a(grp),m(grp), 'binomial', 'link', 'logit');
+ 
+% predict response in test group
+lr=Logistic(B(1) + a(~grp) * (B(2)));
+[~,~,~,AUC] = perfcurve(m(~grp),lr,'1');
+AUC
+mean(lr)
+ 
+% plot of expected mortality
+lr=Logistic(B(1) + linspace(-100,100,201) * B(2));
+plot(lr)
+
+
+
+%% ##################################################################################################################################
+%% 5x5 3D histogram for distrib of action from eICU 250417
+ 
+nra=5;
+ 
+iol=find(ismember(reformat5t.Properties.VariableNames,{'input_4hourly_tev'}));
+vcl=find(ismember(reformat5t.Properties.VariableNames,{'max_dose_vaso'}));
+ 
+ a= reformat5(:,iol);                   %IV fluid
+ a= tiedrank(a(a>0)) / length(a(a>0));   % excludes zero fluid (will be action 1)
+ 
+        iof=floor((a+0.2499999999)*4);  %converts iv volume in 4 actions
+        a= reformat5(:,iol); a=find(a>0);  %location of non-zero fluid in big matrix
+        io=ones(size(reformat5,1),1);  %array of ones, by default     
+        io(a)=iof+1;   %where more than zero fluid given: save actual action
+ 
+        vc=reformat5(:,vcl);  vcr= tiedrank(vc(vc~=0)) / numel(vc(vc~=0)); vcr=floor((vcr+0.249999999999)*4);  %converts to 4 bins
+        vcr(vcr==0)=1; vc(vc~=0)=vcr+1; vc(vc==0)=1;
+ 
+        ma1=[ median(reformat5(io==1,iol))  median(reformat5(io==2,iol))  median(reformat5(io==3,iol))  median(reformat5(io==4,iol))  median(reformat5(io==5,iol))];  %median dose of drug in all bins
+        ma2=[ median(reformat5(vc==1,vcl))  median(reformat5(vc==2,vcl))  median(reformat5(vc==3,vcl))  median(reformat5(vc==4,vcl))  median(reformat5(vc==5,vcl))] ;
+  
+med=[io vc];
+[uniqueValues,~,actionbloc] = unique(array2table(med),'rows');
+ 
+actionbloctrain=actionbloc(train);
+uniqueValuesdose=[ ma2(uniqueValues.med2)' ma1(uniqueValues.med1)'];  % median dose of each bin for all 25 actions
+ 
+% find max doses per bin
+iol=find(ismember(reformat5t.Properties.VariableNames,{'input_4hourly_tev'}));
+vcl=find(ismember(reformat5t.Properties.VariableNames,{'max_dose_vaso'}));
+ma1=[ max(reformat5(io==1,iol))  max(reformat5(io==2,iol))  max(reformat5(io==3,iol))  max(reformat5(io==4,iol))  max(reformat5(io==5,iol))];  %median dose of drug in all bins
+ma2=[ max(reformat5(vc==1,vcl))  max(reformat5(vc==2,vcl))  max(reformat5(vc==3,vcl))  max(reformat5(vc==4,vcl))  max(reformat5(vc==5,vcl))] ;
+ 
+% define actionbloctest = which actions are taken in the test set ????
+vct=Xtestraw(:,4); vct(vct>ma2(nra-1))=nra; vct(vct==0)=1; for z=2:nra-1; vct(vct>ma2(z-1) & vct<=ma2(z))=z;end
+iot=Xtestraw(:,45); for z=2:nra-1; iot(iot>ma1(z-1) & iot<=ma1(z))=z; end;iot(iot>ma1(nra-1))=nra;iot(iot==0)=1;
+ 
+med=[iot vct];
+ 
+figure
+subplot(1,2,1)   % /////////////   ACTUAL ACTIONS   ////////////////
+ 
+[counts] = hist3(med,'Edges',{1:5 1:5})./size(med,1);
+ counts = flipud(counts);
+b=bar3(counts);
+for k = 1:length(b)
+    zdata = b(k).ZData;
+    b(k).CData = zdata;
+    b(k).FaceColor = 'interp';
+end
+
+ax = gca;
+ax.YTick=1:5;
+ax.XTick=1:5;
+ax.YTickLabel = {'>530', '180-530','50-180','1-50','0'};
+ax.XTickLabel = {'0', '0.001-0.08','0.08-0.22','0.22-0.45','>0.45'};
+view(45,35)
+xlabel('Vasopressor dose')
+ylabel('IV fluids dose')
+title('Physicians'' policy')
+c=colorbar;
+c.Label.String = '%';
+axis square
+axis([0.5 5.5 0.5 5.5 0 0.4])
+set(gca,'FontSize',12)
+
+ 
+ 
+subplot(1,2,2)  % /////////////   OPTIMAL ACTIONS   ////////////////
+ 
+OptimalAction=OA(:,bestpol);
+idxtest=idxs(:,bestpol);   %state of records from training set
+OA1=OptimalAction(idxtest);              %optimal action for each record
+
+a=[OA1 floor((OA1-0.0001)./5)+1 OA1-floor(OA1./5)*5];
+a(a(:,3)==0,3)=5;
+med=a(:,[2 3]);
+ 
+[counts] = hist3(med,'Edges',{1:5 1:5})./size(med,1);
+ counts = flipud(counts);
+ b=bar3(counts);
+for k = 1:length(b)
+    zdata = b(k).ZData;
+    b(k).CData = zdata;
+    b(k).FaceColor = 'interp';
+end
+
+view(45,35)
+ 
+colorbar
+ 
+ax = gca;
+ax.YTick=1:5;
+ax.YTickLabel = {'>530', '180-530','50-180','1-50','0'};
+ax.XTick=1:5;
+ax.XTickLabel = {'0', '0.001-0.08','0.08-0.22','0.22-0.45','>0.45'};
+ 
+xlabel('Vasopressor dose')
+ylabel('IV fluids dose')
+title('Optimal policy')
+c=colorbar;
+c.Label.String = '%';
+axis square
+axis([0.5 5.5 0.5 5.5 0 0.4])
+set(gca,'FontSize',12)
+ 
+
+
+
+%% ##################################################################################################################################
+%% Heatmap of Q values
+ 
+ii=rectest(:,11)==5;
+a=rectest(ii,[2 13]);
+sum(rectest(ii,13)>= rectest(ii,2))/size(rectest(ii,1),1)
+[counts] = hist3(a,'Edges',{-105:2.5:100 -105:2.5:100}');
+ 
+counts = rot90(counts);
+disp('mean actual - mean optimal - median actual - median optimal' )
+[nanmean(rectest(ii,2)) nanmean(rectest(ii,13)) nanmedian(rectest(ii,2)) nanmedian(rectest(ii,13))]
+ 
+% heatmap
+figure
+imagesc(log10(counts))
+colormap jet% gray % hsv
+c=colorbar;
+c.Label.String = 'Log10 of counts of records';
+axis square
+ hold on
+ axis([1 83 1 83])
+ line([1 83],[83 1],'LineWidth',2,'color','w');
+
+ax = gca;
+ax.YTick=1:10:100;
+ax.YTickLabel = {'100', '75','50','25','0','-25','-50','-75','-100'};
+ax.XTick=2:10:100;
+ax.XTickLabel = {'-100','-75','-50','-25','0','25','50','75','100'};
+xlabel('Q value of actual actions')
+ylabel('Q value of optimal actions')
+set(gca,'FontSize',12)
+hold off
+
+
+
+%% ##################################################################################################################################
+%% 2D histograms average dose gap vs mortality
+
+tic 
+ 
+rectest(:,9)= rectest(:,4)- rectest(:,5);  %given  - reco  VASOPRESSORS
+rectest(:,10)= rectest(:,6)- rectest(:,7);  %FLUIDS
+ii=rectest(:,11)==5;
+ 
+r=array2table(rectest(ii,[14 8 9 10]));  
+r.Properties.VariableNames = {'id','morta','vaso','ivf'};
+d=grpstats(r,'id',{'mean','median','sum'});
+d3=([d.mean_morta d.mean_vaso d.mean_ivf d.median_vaso d.median_ivf d.sum_ivf d.GroupCount]);
+ 
+ 
+ 
+a=[];   % IV fluids
+
+
+t=[-1e10,-1000,-500,-250,-100,-10,10,100,250,500,1000,1e10];  %thresholds
+t=[-1e10, -500,-250,-40,40,250,500,1000,2000,1e10];  %thresholds
+
+for i=1:numel(t)-1
+       ii=d3(:,3)>=t(i) & d3(:,3)<=t(i+1);  %mean
+       ii=d3(:,5)>=t(i) & d3(:,5)<=t(i+1);  %median
+    a=[a ; [t(i) t(i+1) sum(ii) nanmean(d3(ii,1)) nanstd(d3(ii,1))]];
+end
+ 
+a(:,5)=a(:,5)./sqrt(a(:,3));  % SEM !!
+a(:,3)=a(:,3)./sum(a(:,3));  % percentage of pts in each bin
+ 
+figure
+subplot(1,2,1)
+supererr(1.15:9.15,a(:,4),[],a(:,5),'T',0.3)
+hold on
+b=bar(a(:,3:4),1);
+% b(1).Width=0.5;
+b(1).FaceColor=[1 1 0];
+b(2).FaceColor=[0.5 0.5 1];
+set(gca,'FontSize',12)
+ 
+hold off
+ 
+axis([0 10 0 1])
+axis square
+ax = gca;
+ax.XTick=1:9; 
+l={'<-100','-50 to -100','-10 to -50','-10 to 10', '10 to 50','50 to 100','100 to 250','250 to 500','>500'};
+l={'<-500','-250 to -500','-40 to -250','-40 to 40', '40 to 250','250 to 500','500 to 1000','1000 to 2000','>2000'};
+ 
+ax.XTickLabel = l;
+ax.XTickLabelRotation = 45; 
+
+legend([b(1) b(2)],{'Proportion of patients','Average mortality'},'location','nw')
+ylabel('Propotion of patients or mortality (SEM)')
+xlabel('Average intravenous fluids dose excess (mL/4h)')
+ 
+ 
+b=[];     % vasopressors
+
+
+t=[-1e10,-0.4,-0.2,-0.1,-0.02,0.02,0.1,0.2,0.4,1e10];
+ 
+for i=1:numel(t)-1
+       ii=d3(:,2)>=t(i) & d3(:,2)<=t(i+1);
+       ii=d3(:,4)>=t(i) & d3(:,4)<=t(i+1);   %median
+    b=[b ; [t(i) t(i+1) sum(ii) nanmean(d3(ii,1)) nanstd(d3(ii,1))]];
+end
+b(:,5)=b(:,5)./sqrt(b(:,3));  % SEM !!
+b(:,3)=b(:,3)./sum(b(:,3));
+ 
+subplot(1,2,2);
+supererr(1.15:9.15,b(:,4),[],b(:,5),'T',0.3)
+hold on
+b=bar(b(:,3:4),1);
+b(1).FaceColor=[1 1 0];
+b(2).FaceColor=[1 0.3 0.3];
+set(gca,'FontSize',12)
+axis([0 10 0 1])
+ 
+annotation('arrow',[0.737 0.737],[0.65,0.5])
+annotation('arrow',[0.265 0.265],[0.75,0.6])
+ 
+axis square
+ax = gca;
+ax.XTick=1:9; 
+l={'<-0.4', '-0.2 to -0.4','-0.1 to -0.2','-0.02 to -0.1','-0.02 to 0.02', '0.02 to 0.1','0.1 to 0.2','0.2 to 0.4','>0.4'};
+ax.XTickLabel = l;
+ax.XTickLabelRotation = 45; 
+ 
+legend([b(1) b(2)],{'Proportion of patients','Average mortality'})
+ylabel('Propotion of patients or mortality (SEM)')
+xlabel('Average vasopressors dose excess (mcg/kg/min)')
+hold off
+
 
 
