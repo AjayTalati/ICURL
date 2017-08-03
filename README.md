@@ -1,6 +1,7 @@
 # Reinforcement learning in intensive care
 
 Code for reinforcement learning for sepsis treatment in ICU
+
 Author: Matthieu Komorowski, Imperial College London, 2016-2017
 
 This repository contains PostgreSQL and Matlab code to:
