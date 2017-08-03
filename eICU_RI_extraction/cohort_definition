@@ -1,0 +1,77 @@
+-- Create temporary cohort of adults with no readmissions
+
+create table public.cohort1 as (
+select * from
+(
+select *, cast( case when age like '%>%' then '91.4' when age = '' then '0' else age end as numeric )as agenum
+from eicu.patient
+where unitvisitnumber=1
+) as temp1
+where temp1.agenum>=18
+
+);
+
+
+-- Extract antibiotics
+
+create table public.abx3 as
+(
+with t1 as
+(
+select patientunitstayid, treatmentoffset as offset
+from eicu.treatment
+where treatmentoffset between -2880 and 5760 and btrim(lower(treatmentstring)) like any ('{%antibact%,%antibio%,%amika%,%genta%,%tobra%,%cillin%,%vanco%,%cyclin%,%xacin%,%mycin%,%metrondaz%,%clavula%,%tazob%,%vancin%,%penem%,%micin%,%cefur%,%ceftri%,%cephal%}')
+), t2 as
+(
+
+select patientunitstayid,  drugstartoffset as offset
+from eicu.medication
+where drugstartoffset between -2880 and 5760 and drughiclseqno in (3935,	3936,	3937,	3938,	3940,	3941,	3942,	3951,	3952,	3953,	3963,	6077,	 3946,	3956,	3957,	3960,	5886,	35575,	39531,	3943,	3965,	8738,	32900,	33427, 3948, 3962, 3795, 3796,	3972,	13908,	22796	,25040	,25040	,26808,	26809,35282, 3978,	3979,	3983,3990,	3991,	3992,	3998,	6009,	6012,	6313	,8949	,25953, 33772,	35169,	3984	,3985	,3995,	3996	,6945	,8630,	10246,	13417,	13426	,13429, 15717,	18548	,26487,	26488	,29980,	33094	,37769, 10132,	35848,	37021	,37243	,4054, 11254, 23241	,35075,	4053,	6447, 4049,	4050,	4051,	36242,	21157,	6701,	6702,	12383, 25388,112384,	4042,	4042,	8466	,10093	,37442	,3532,	4030,	4032,	4033,	4034, 4035, 5887,	12090,	16926	,17765,	33290,	34362,	35990	, 25673,	4043,	4045	,4704, 4003, 4012, 4013,	4014,	4015,	5263,	35229	,35908,	36033,	4020,	6334,	34503	,4156,	4157, 7779, 8259, 4071, 4087	,4089	,6322, 32986, 20518	,37674	)
+-- btrim(lower(drugname)) like any ('{%amika%,%genta%,%tobra%,%cillin%,%vanco%,%cyclin%,%xacin%,%mycin%,%metrondaz%,%clavula%,%tazob%,%vancin%,%penem%,%micin%,%cefur%,%ceftri%,%cephal%}')
+)
+
+select distinct pt.patientunitstayid, -- t1.offset as t1offset, t2.offset as t2offset,
+case when t1.offset is not null and t2.offset is null then t1.offset
+when t2.offset is not null and t1.offset is null then t2.offset
+when t1.offset <t2.offset then t1.offset
+when t2.offset <= t1.offset then t2.offset
+else null end as aboffset
+from public.cohort_goodhx_adults pt
+left outer join t1
+on t1.patientunitstayid=pt.patientunitstayid
+left outer join t2
+on t2.patientunitstayid=pt.patientunitstayid
+order by patientunitstayid, aboffset
+);
+
+-- Fluid samples for culture
+
+create table bacterio as
+(
+
+with t1 as
+(
+select distinct patientunitstayid, culturetakenoffset as offset
+from eicu.microlab
+where culturetakenoffset > -1440
+), t2 as
+(
+select distinct patientunitstayid, treatmentoffset as offset
+from eicu.treatment
+where lower(treatmentstring) like '%culture%' and treatmentoffset > -1440
+)
+
+select distinct pt.patientunitstayid, -- t1.offset, t2.offset,
+case when t1.offset is not null and t2.offset is null then t1.offset
+when t2.offset is not null and t1.offset is null then t2.offset
+when t1.offset <t2.offset then t1.offset
+when t2.offset <= t1.offset then t2.offset
+else null end as bcoffset
+from public.cohort1 pt
+left outer join t1
+on t1.patientunitstayid=pt.patientunitstayid
+left outer join t2
+on t2.patientunitstayid=pt.patientunitstayid
+order by pt.patientunitstayid, bcoffset
+);
+
