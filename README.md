@@ -1,6 +1,6 @@
 # Reinforcement learning in intensive care
 
-Code for reinforcement learning for sepsis treatment in ICU
+Code for reinforcement learning applied to the management of intravenous fluids and vasopressors in sepsis, in intensive care patients.
 
 Author: Dr Matthieu Komorowski, Imperial College London, 2016-2017 - m.komorowski14@imperial.ac.uk
 
