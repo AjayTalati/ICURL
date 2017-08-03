@@ -1,1 +1,762 @@
-test
+
+Demographics
+
+
+Create table public.eicu2demog as
+(
+select cohort.patientunitstayid,
+max(case when pt.gender = 'Male' then 1 when pt.gender='Female' then 2 else null end) as gender,
+max(case when pt.age like '%>%' then '91.4' when pt.age is null then null else pt.age end) as age,
+max(case when pt.admissionweight is null then null else pt.admissionweight end) as admissionweight,
+max(case when 	pt.dischargeweight is null then null else 	pt.dischargeweight end) as dischargeweight,
+max(case when pt.apacheadmissiondx is null then null else pt.apacheadmissiondx end) as apacheadmissiondx,
+max(case when pt.hospitalid is null then null else pt.hospitalid end) as hospitalid,
+max(case when pt.unittype is null then null else pt.unittype  end) as unittype,
+max(case when pt.hospitaladmitsource  is null then null else pt.hospitaladmitsource end) as hospitaladmitsource_string,
+max(case when pt.unitadmitsource  is null then null else pt.unitadmitsource end) as unitadmitsource_string,
+max(case when pt.unitvisitnumber is null then null else pt.unitvisitnumber  end) as unitvisitnumber,
+max(case when pt.hospitaladmitoffset is null then null else -pt.hospitaladmitoffset end) as delayhospitaladmittoicuadmit,
+max(case When pt.unitdischargestatus = 'Alive' Then 0
+When pt.unitdischargestatus Is Null Then Null
+when pt.unitdischargestatus = 'Expired' then 1 else 2 End ) As icumortality,
+max(case When pt.hospitaldischargestatus = 'Alive' Then 0
+When pt.hospitaldischargestatus Is Null and pt.unitdischargestatus = 'Expired' Then 1  -- if Hx mortality is missing but we know that he died in ICU then use ICU mortality
+when pt.hospitaldischargestatus = 'Expired' then 1 else 2 End ) As hospmortality,
+max(case when  pt.unitdischargeoffset is null then null else pt.unitdischargeoffset end) as iculos
+
+from public.cohort7 cohort
+left outer join eicu.patient pt
+on cohort.patientunitstayid=pt.patientunitstayid
+group by cohort.patientunitstayid
+);
+
+GCS
+
+From table nursecharting (largest source)
+
+Create table public.eicu2gcs1 as
+(
+
+with t1 as
+(
+select pt.patientunitstayid, nursingchartoffset, cast(nursingchartvalue as numeric) as gcs, floor(nursingchartoffset/240)+1 as bloc
+from eicu.nursecharting, public.cohort7 pt
+where nursecharting.patientunitstayid=pt.patientunitstayid and (nursingchartcelltypevalname)='GCS Total' and nursingchartvalue <> '' and nursingchartvalue ~ '^[0-9]{0,2}$'
+-- group by pt.patientunitstayid, nursingchartoffset, nursingchartvalue
+)
+
+select patientunitstayid, bloc, round(avg(gcs),2) as gcs
+from t1
+where nursingchartoffset between 0 and 4320
+group by patientunitstayid, bloc
+);
+
+From table physicalexam (2nd source, if NC is missing)
+
+Create table public.eicu2gcs2 as
+(
+
+with t1 as
+(
+select pt.patientunitstayid, physicalexamoffset, sum(cast(physicalexamvalue as numeric)) as gcs, floor(physicalexamoffset/240)+1 as bloc
+from eicu.physicalexam pe, public.cohort7 pt
+where (lower(physicalexampath) like '%gcs/eyes%' or lower(physicalexampath) like '%gcs/verbal%' or lower(physicalexampath) like '%gcs/motor%')
+and pe.patientunitstayid=pt.patientunitstayid 
+and physicalexamvalue <> ''  and physicalexamvalue ~ '^[0-9]{0,2}$' -- and patientunitstayid in (243409,245599,250712,255828,262640,266628)
+group by pt.patientunitstayid, physicalexamoffset
+)
+
+select patientunitstayid, bloc, round(avg(gcs),2) as gcs
+from t1
+where physicalexamoffset between 0 and 4320
+group by patientunitstayid, bloc
+
+);
+
+
+Vital signs
+
+For HR, SaO2, RR, main source of data is vitalperiodic. If missing, nursecharting is used.
+For blood pressure, main source is vitalaperiodic. If missing, nursecharting is used.
+
+From vitalperiodic
+
+[OMAR: this is not validated! Automatically recorded!! I may want to exclude abnormal values, e.g. zero HR due to fallen electrode – consider delete zeros, for example RR, MAP, HR !!!!]
+
+Create table public.eicu2vitals as
+(
+select distinct pt.patientunitstayid, floor(observationoffset/240)+1 as bloc,
+round( cast(avg(heartrate) as numeric) ,2) as hr,
+round( cast(avg(sao2) as numeric) ,2) as sao2,
+round( cast(avg(respiration) as numeric) ,2) as rr
+from eicu.vitalperiodic 
+join public.cohort7 pt
+on pt.patientunitstayid=vitalperiodic.patientunitstayid
+where observationoffset between 0 and 4320
+group by pt.patientunitstayid, bloc
+);
+
+From nursecharting
+
+This occurs in several steps to speed up the process.
+
+-- Step 1: extract raw values for vitals and BP
+
+create table public.eicu2vitalsbpraw as
+(
+
+with tm1 as
+(
+
+with tm2 as
+(
+select pt.patientunitstayid, nursingchartoffset, nursingchartcelltypevalname, nursingchartvalue
+from eicu.nursecharting
+join public.cohort7 pt on cohort7.patientunitstayid = nursecharting.patientunitstayid
+)
+select * from tm2
+where nursingchartcelltypevalname = any ('{Heart Rate,O2 Saturation,Respiratory Rate,Non-Invasive BP Systolic,Non-Invasive BP Diastolic,Non-Invasive BP Mean}') -- [OMAR: there are a lot of other non standard regex]
+
+
+)
+
+select * from tm1
+where nursingchartvalue <> '' and nursingchartvalue ~  '^[0-9\/.]{1,8}$'
+);
+
+
+-- Step 2 = extract raw values per variable and compute time blocs
+
+create table public.eicu2vitalsbpraw2 as
+(
+
+select patientunitstayid, floor(nursingchartoffset/240)+1 as bloc,
+max(case when nursingchartcelltypevalname='Heart Rate' then nursingchartvalue else null end) as hr,
+max(case when nursingchartcelltypevalname='O2 Saturation' and nursingchartvalue not like '%/%'  then nursingchartvalue else null end) as spo2,
+max(case when nursingchartcelltypevalname='Respiratory Rate' then nursingchartvalue else null end) as rr,
+max(case when nursingchartcelltypevalname='Non-Invasive BP Systolic' and nursingchartvalue like '%/%' then split_part(nursingchartvalue,'/',1)
+when nursingchartcelltypevalname='Non-Invasive BP Systolic' then nursingchartvalue else null end) as sysbp,
+max(case when nursingchartcelltypevalname='Non-Invasive BP Systolic' and nursingchartvalue like '%/%' then split_part(nursingchartvalue,'/',2)
+when nursingchartcelltypevalname='Non-Invasive BP Diastolic'  then nursingchartvalue else null end) as diabp,
+max(case when nursingchartcelltypevalname='Non-Invasive BP Mean'  then nursingchartvalue else null end) as meanbp
+from public.eicu2vitalsbpraw
+where nursingchartoffset between 0 and 4320 and nursingchartvalue ~  '^[0-9\/.]{1,8}$'
+group by patientunitstayid, nursingchartoffset
+
+);
+
+
+-- Step 3 = compute average per bloc
+
+create table public.eicu2vitalsbpnc as
+(
+select patientunitstayid, bloc,
+round( avg(cast((hr) as numeric) ),2) as hr,
+round( avg(cast((spo2) as numeric)) ,2) as spo2,
+round( avg(cast((rr) as numeric)) ,2) as rr,
+round( avg(cast((sysbp) as numeric)) ,2) as sbp,
+round( avg(cast((diabp) as numeric)) ,2) as dbp,
+round( avg(cast((meanbp) as numeric)) ,2) as mbp
+from eicu2vitalsbpraw2
+group by patientunitstayid, bloc
+-- order by patientunitstayid, bloc
+);
+
+
+BP from vitalaperiodic
+
+Create table public.eicu2bp as
+(
+select distinct pt.patientunitstayid, floor(observationoffset/240)+1 as bloc,
+round( cast(avg(noninvasivesystolic) as numeric) ,3) as sbp,
+round( cast(avg(noninvasivediastolic) as numeric) ,2) as dbp,
+round( cast(avg(noninvasivemean) as numeric) ,2) as mbp
+
+from public.cohort7 pt
+left outer join eicu.vitalaperiodic
+on pt.patientunitstayid=vitalaperiodic.patientunitstayid
+where observationoffset between 0 and 4320
+group by pt.patientunitstayid, bloc
+);
+
+Temperature
+
+Create table public.eicu2tempc as
+(
+with t1 as
+(
+select pt.patientunitstayid, nursingchartoffset, floor(nursingchartoffset/240)+1 as bloc, nursingchartvalue as tempe
+from eicu.nursecharting
+join public.cohort7 pt
+on nursecharting.patientunitstayid=pt.patientunitstayid 
+where (nursingchartcelltypevalname) = 'Temperature (C)' and nursingchartvalue <> '' and nursingchartvalue ~ '^[0-9.]{0,4}$' [OMAR: keep all temperature values, convert to celcius later]
+)
+
+select patientunitstayid, bloc, round(avg(cast(tempe as numeric)),2) as tempc
+from t1
+where nursingchartoffset between 0 and 4320
+group by patientunitstayid,bloc
+
+);
+
+
+
+
+Labs
+
+Real-time labs are used. If labs are missing on admission, pre-admission labs (up to 12h pre-admission) are used.
+
+Pre-admission
+
+
+Create table public.eicu2prelabs as
+(
+
+select pt.patientunitstayid,
+round(avg(case when labname='sodium' then labresult else null end),2) as sodium,round(avg(case when labname='potassium' then labresult else null end),2) as potassium,round(avg(case when labname='chloride' then labresult else null end),2) as chloride,round(avg(case when labname='glucose' then labresult else null end),2) as glucose,round(avg(case when labname='BUN' then labresult else null end),2) as bun,round(avg(case when labname='creatinine' then labresult else null end),2) as creatinine,round(avg(case when labname='magnesium' then labresult else null end),2) as magnesium,round(avg(case when labname='calcium' then labresult else null end),2) as calcium,round(avg(case when labname='total bilirubin' then labresult else null end),2) as bili,round(avg(case when labname='AST (SGOT)' then labresult else null end),2) as sgot,round(avg(case when labname='ALT (SGPT)' then labresult else null end),2) as sgpt,round(avg(case when labname='albumin' then labresult else null end),2) as albumin,round(avg(case when labname='Hgb' then labresult else null end),2) as hb,round(avg(case when labname='WBC x 1000' then labresult else null end),2) as wbc,round(avg(case when labname='platelets x 1000' then labresult else null end),2) as plt,round(avg(case when labname='PTT' then labresult else null end),2) as ptt,round(avg(case when labname='PT' then labresult else null end),2) as pt,round(avg(case when labname='PT - INR' then labresult else null end),2) as inr,round(avg(case when labname='pH' then labresult else null end),2) as ph,round(avg(case when labname='paO2' then labresult else null end),2) as pao2,round(avg(case when labname='paCO2' then labresult else null end),2) as paco2,round(avg(case when labname='Base Excess' then labresult else null end),2) as be,round(avg(case when labname='Base Deficit' then labresult else null end),2) as bd,round(avg(case when labname='FiO2' then labresult else null end),2) as fio2,round(avg(case when labname='HCO3' then labresult else null end),2) as hco3,round(avg(case when labname='lactate' then labresult else null end),2) as lactate
+from eicu.lab
+join public.cohort7 pt
+on pt.patientunitstayid=eicu.lab.patientunitstayid
+where labname = any ('{sodium,potassium,chloride,glucose,BUN,creatinine,magnesium,calcium,total bilirubin,AST (SGOT),ALT (SGPT),albumin,Hgb,WBC x 1000,platelets x 1000,PTT,PT,PT - INR,pH,paO2,paCO2,Base Excess,Base Deficit,FiO2,HCO3,lactate}') and labresultoffset between -720 and 0
+group by pt.patientunitstayid
+);
+
+
+Real-time
+
+
+Create table public.eicu2labs as
+(
+
+with tempo as
+(
+select pt.patientunitstayid, labresultoffset, floor(labresultoffset/240)+1 as bloc,
+max(case when labname='sodium' then labresult else null end) as sodium,max(case when labname='potassium' then labresult else null end) as potassium,max(case when labname='chloride' then labresult else null end) as chloride,max(case when labname='glucose' then labresult else null end) as glucose,max(case when labname='BUN' then labresult else null end) as bun,max(case when labname='creatinine' then labresult else null end) as creatinine,max(case when labname='magnesium' then labresult else null end) as magnesium,max(case when labname='calcium' then labresult else null end) as calcium,max(case when labname='total bilirubin' then labresult else null end) as bili,max(case when labname='AST (SGOT)' then labresult else null end) as sgot,max(case when labname='ALT (SGPT)' then labresult else null end) as sgpt,max(case when labname='albumin' then labresult else null end) as albumin,max(case when labname='Hgb' then labresult else null end) as hb,max(case when labname='WBC x 1000' then labresult else null end) as wbc,max(case when labname='platelets x 1000' then labresult else null end) as plt,max(case when labname='PTT' then labresult else null end) as ptt,max(case when labname='PT' then labresult else null end) as pt,max(case when labname='PT - INR' then labresult else null end) as inr,max(case when labname='pH' then labresult else null end) as ph,max(case when labname='paO2' then labresult else null end) as pao2,max(case when labname='paCO2' then labresult else null end) as paco2,max(case when labname='Base Excess' then labresult else null end) as be,max(case when labname='Base Deficit' then labresult else null end) as bd,max(case when labname='FiO2' then labresult else null end) as fio2,max(case when labname='HCO3' then labresult else null end) as hco3,max(case when labname='lactate' then labresult else null end) as lactate
+from public.cohort7 pt
+left outer join eicu.lab
+on pt.patientunitstayid=eicu.lab.patientunitstayid
+where labname = any ('{sodium,potassium,chloride,glucose,BUN,creatinine,magnesium,calcium,total bilirubin,AST (SGOT),ALT (SGPT),albumin,Hgb,WBC x 1000,platelets x 1000,PTT,PT,PT - INR,pH,paO2,paCO2,Base Excess,Base Deficit,FiO2,HCO3,lactate}') and labresultoffset between 0 and 4320
+group by pt.patientunitstayid, labresultoffset, labresult
+)
+select patientunitstayid, bloc,
+round(avg(sodium),2) as sodium,round(avg(potassium),2) as potassium,round(avg(chloride),2) as chloride,round(avg(glucose),2) as glucose,round(avg(bun),2) as BUN,round(avg(creatinine),2) as creatinine,round(avg(magnesium),2) as magnesium,round(avg(calcium),2) as calcium,round(avg(bili),2) as bili,round(avg(sgot),2) as sgot,round(avg(sgpt),2) as sgpt,round(avg(albumin),2) as albumin,round(avg(hb),2) as hb,round(avg(wbc),2) as wbc,round(avg(plt),2) as plt,round(avg(ptt),2) as ptt,round(avg(pt),2) as pt,round(avg(inr),2) as inr,round(avg(ph),2) as ph,round(avg(pao2),2) as pao2,round(avg(paco2),2) as paco2,round(avg(be),2) as be,round(avg(bd),2) as bd,round(avg(fio2),2) as fio2,round(avg(hco3),2) as hco3,round(avg(lactate),2) as lactate
+from tempo
+group by patientunitstayid, bloc
+);
+
+
+Mechanical ventilation
+
+From 3 sources, similar to what was done to compute SOFA score for cohort definition.
+
+
+Create table public.eicu2mechvent as
+(
+with tempo as
+(
+
+with t1 as
+(
+select distinct patientunitstayid, respcarestatusoffset as offset,
+max(case when airwaytype in ('Oral ETT','Nasal ETT','Tracheostomy') then 1 else NULL end) as airway  -- either invasive airway or NULL
+from eicu.respiratorycare
+where respcarestatusoffset between 0 and 4320
+
+group by patientunitstayid , respcarestatusoffset
+-- order by patientunitstayid , respcarestatusoffset
+),
+
+t2 as
+(
+select distinct patientunitstayid, respchartoffset as offset, 1 as ventilator
+from eicu.respiratorycharting rc
+where lower(respchartvaluelabel) like '%ventilator%'  -- most likely on a vent
+or lower(respchartvaluelabel) like '%vent%'
+or lower(respchartvaluelabel) like '%bipap%'
+or lower(respchartvaluelabel) like '%840%'
+or lower(respchartvaluelabel) like '%cpap%'
+or lower(respchartvaluelabel) like '%drager%'
+or lower(respchartvaluelabel) like 'mv%'
+or lower(respchartvaluelabel) like '%servo%'
+or lower(respchartvaluelabel) like '%peep%'
+and respchartoffset between 0 and 4320
+group by patientunitstayid, respchartoffset
+-- order by patientunitstayid, respchartoffset
+),
+
+t3 as
+(
+select distinct patientunitstayid, treatmentoffset as offset, max(case when treatmentstring in
+('pulmonary|ventilation and oxygenation|mechanical ventilation','pulmonary|ventilation and oxygenation|tracheal suctioning','pulmonary|ventilation and oxygenation|ventilator weaning','pulmonary|ventilation and oxygenation|mechanical ventilation|assist controlled','pulmonary|radiologic procedures / bronchoscopy|endotracheal tube','pulmonary|ventilation and oxygenation|oxygen therapy (> 60%)','pulmonary|ventilation and oxygenation|mechanical ventilation|tidal volume 6-10 ml/kg','pulmonary|ventilation and oxygenation|mechanical ventilation|volume controlled','surgery|pulmonary therapies|mechanical ventilation','pulmonary|surgery / incision and drainage of thorax|tracheostomy','pulmonary|ventilation and oxygenation|mechanical ventilation|synchronized intermittent','pulmonary|surgery / incision and drainage of thorax|tracheostomy|performed during current admission for ventilatory support','pulmonary|ventilation and oxygenation|ventilator weaning|active','pulmonary|ventilation and oxygenation|mechanical ventilation|pressure controlled','pulmonary|ventilation and oxygenation|mechanical ventilation|pressure support','pulmonary|ventilation and oxygenation|ventilator weaning|slow','surgery|pulmonary therapies|ventilator weaning','surgery|pulmonary therapies|tracheal suctioning','pulmonary|radiologic procedures / bronchoscopy|reintubation','pulmonary|ventilation and oxygenation|lung recruitment maneuver','pulmonary|surgery / incision and drainage of thorax|tracheostomy|planned','surgery|pulmonary therapies|ventilator weaning|rapid','pulmonary|ventilation and oxygenation|prone position','pulmonary|surgery / incision and drainage of thorax|tracheostomy|conventional','pulmonary|ventilation and oxygenation|mechanical ventilation|permissive hypercapnea','surgery|pulmonary therapies|mechanical ventilation|synchronized intermittent','pulmonary|medications|neuromuscular blocking agent','surgery|pulmonary therapies|mechanical ventilation|assist controlled','pulmonary|ventilation and oxygenation|mechanical ventilation|volume assured','surgery|pulmonary therapies|mechanical ventilation|tidal volume 6-10 ml/kg','surgery|pulmonary therapies|mechanical ventilation|pressure support') then 1  else NULL end) as interface   -- either ETT/NiV or NULL
+from eicu.treatment
+where treatmentoffset between 0 and 4320
+group by patientunitstayid, treatmentoffset -- , interface
+-- order by patientunitstayid, treatmentoffset
+)
+
+select distinct pt.patientunitstayid,
+case when t1.offset<= coalesce(t2.offset,99999) and t1.offset<=coalesce(t3.offset,99999) then t1.offset
+when t2.offset<= coalesce(t1.offset,99999) and t2.offset<=coalesce(t3.offset,99999) then t2.offset
+when t3.offset<= coalesce(t1.offset,99999) and t3.offset<=coalesce(t2.offset,99999) then t3.offset
+else null end as offset,
+case when t1.airway is not null or t2.ventilator is not null or t3.interface is not null then 1 else null end as mechvent
+from public.cohort7 pt
+left outer join t1
+on t1.patientunitstayid=pt.patientunitstayid
+left outer join t2
+on t2.patientunitstayid=pt.patientunitstayid
+left outer join t3
+on t3.patientunitstayid=pt.patientunitstayid
+-- order by pt.patientunitstayid
+)
+
+select *, floor(tempo.offset/240)+1 as bloc
+from tempo
+where mechvent=1
+-- order by patientunitstayid, bloc
+);
+
+
+FiO2 from mechanical ventilation data
+
+Used as a second source, when FiO2 not available from ABG.
+
+Create table public.eicu2fio2mv as
+(
+with t1 as
+(
+select distinct pt.patientunitstayid, respchartoffset, floor(respchartoffset/240)+1 as bloc, -- respchartvaluelabel,
+case when cast(respchartvalue as numeric) > 20 then cast(respchartvalue as numeric)
+when cast(respchartvalue as numeric)<2 then cast(respchartvalue as numeric)*100  -- convert fio2 to percent
+else null end as fio2
+from eicu.respiratorycharting rc, public.cohort7 pt
+where rc.patientunitstayid=pt.patientunitstayid and lower(respchartvaluelabel) like '%fio2%' and respchartvalue <> '' and respchartvalue ~ '^[0-9.]{0,4}$'
+)
+
+select patientunitstayid, bloc, max(coalesce(fio2,0)) as fio2
+from t1
+where respchartoffset between 0 and 4320 and fio2 is not null
+group by patientunitstayid, bloc
+
+);
+
+Fluid intake
+
+I wanted to include all items that correspond to IV crystalloids, colloids and blood products (not medications, not dextrose). There are over 250,000 unique items in intakeoutput. I ranked them by frequency and created a list of regex to exclude non-suitable items, covering in frequency over 99% of all possible items.
+
+
+List of all labels with count, from intakeoutput
+
+create table public.eicuiolabels as
+(
+select cellpath, count(*), round(avg(cellvaluenumeric),2) as avgvol
+from eicu.intakeoutput
+group by cellpath
+order by count desc
+);
+
+Removing wrong labels
+
+create table public.eicuiogoodlabels as
+(
+select * from public.eicuiolabels
+where lower(cellpath) not like '%enteral%'
+and lower(cellpath)  not like '%total%'
+and lower(cellpath)  not like '%shift%'
+and lower(cellpath)  not like '%tube%'
+and lower(cellpath)  not like '%nutrition%'
+and lower(cellpath)  not like '%po%'
+and lower(cellpath)  not like '%drain%'
+and lower(cellpath)  not like '%og%'
+and lower(cellpath)  not like '%meds%'
+and lower(cellpath)  not like '%jp%'
+and lower(cellpath)  not like '%peg%'
+and lower(cellpath)  not like '%stool%'
+and lower(cellpath)  not like '%fecal%'
+and lower(cellpath)  not like '%loss%'
+and lower(cellpath)  not like '%weight%'
+and lower(cellpath)  not like '%gastric%'
+and lower(cellpath)  not like '%d5w%'
+and lower(cellpath)  not like '%meal%'
+and lower(cellpath)  not like '%oral%'
+and lower(cellpath)  not like '%tpn%'
+and lower(cellpath)  not like '%pca%'
+and lower(cellpath)  not like '%pcea%'
+and lower(cellpath)  not like '%ventric%'
+and lower(cellpath)  not like '%emesis%'
+and lower(cellpath)  not like '%d10w%'
+and lower(cellpath)  not like '%csf%'
+and lower(cellpath)  not like '%bowel%'
+and lower(cellpath)  not like '%emul%'
+and lower(cellpath)  not like '%epid%'
+and lower(cellpath)  not like '%ileo%'
+and lower(cellpath)  not like '%colo%'
+and lower(cellpath)  not like '%ventr%'
+and lower(cellpath)  not like '%wound%'
+and lower(cellpath)  not like '%vac%'
+and lower(cellpath)  not like '%illeo%'
+and lower(cellpath)  not like '%intest%'
+and lower(cellpath)  not like '%diarr%'
+and lower(cellpath)  not like '%flexi%'
+and lower(cellpath)  not like '%gastro%'
+and lower(cellpath)  not like '%ng tu%'
+and lower(cellpath)  not like '%water%'
+and lower(cellpath)  not like '%chest%'
+and lower(cellpath)  not like '%pleura%'
+and lower(cellpath)  not like '%thora%'
+and lower(cellpath)  not like '%peric%'
+and lower(cellpath)  not like '%medias%'
+and lower(cellpath)  not like '%brain%'
+and lower(cellpath)  not like '%head%'
+and lower(cellpath)  not like '%water%'
+and lower(cellpath)  not like '%fistul%'
+and lower(cellpath)  not like '%jejuno%'
+and lower(cellpath)  not like '%jackson%'
+and lower(cellpath)  not like '%perito%'
+and lower(cellpath)  not like '%abdo%'
+and lower(cellpath)  not like '%paracen%'
+and lower(cellpath)  not like '%murphy%'
+and lower(cellpath)  not like '%murphey%'
+and lower(cellpath)  not like '%blake%'
+and lower(cellpath)  not like '%irrig%'
+and lower(cellpath)  not like '%ascit%'
+and lower(cellpath)  not like '%misc%'
+and lower(cellpath)  not like '%bulb%'
+and lower(cellpath)  not like '%surg%'
+ and lower(cellpath)  not like '%fenta%'
+ and lower(cellpath)  not like '%propo%'
+ and lower(cellpath)  not like '%midaz%'
+ and lower(cellpath)  not like '%cillin%'
+ and lower(cellpath)  not like '%mycin%'
+ and lower(cellpath)  not like '%hepar%'
+ and lower(cellpath)  not like '%epine%'
+ and lower(cellpath)  not like '%insul%'
+ and lower(cellpath)  not like '%amiod%'
+ and lower(cellpath)  not like '%zosyn%'
+ and lower(cellpath)  not like '%azol%'
+ and lower(cellpath)  not like '%dopam%'
+ and lower(cellpath)  not like '%dexmed%'
+ and lower(cellpath)  not like '%antibio%'
+ and lower(cellpath)  not like '%phenyl%'
+ and lower(cellpath)  not like '%milrin%'
+ and lower(cellpath)  not like '%levop%'
+ and lower(cellpath)  not like '%lipid%'
+ and lower(cellpath)  not like '%furos%'
+ and lower(cellpath)  not like '%diltia%'
+ and lower(cellpath)  not like '%dipriv%'
+ and lower(cellpath)  not like '%vasopr%'
+ and lower(cellpath)  not like '%versed%'
+ and lower(cellpath)  not like '%snack%'
+ and lower(cellpath)  not like '%neosyn%'
+ and lower(cellpath)  not like '%curium%'
+ and lower(cellpath)  not like '%dobut%'
+ and lower(cellpath)  not like '%amicar%'
+ and lower(cellpath)  not like '%dipine%'
+ and lower(cellpath)  not like '%carden%'
+ and lower(cellpath)  not like '%precedex%'
+ and lower(cellpath)  not like '%prolol%'
+ and lower(cellpath)  not like '%ronium%'
+ and lower(cellpath)  not like '%cardiz%'
+ and lower(cellpath)  not like '%protonix%'
+ and lower(cellpath)  not like '%nitropru%'
+ and lower(cellpath)  not like '%vanco%'
+order by count desc
+)
+
+
+Preadmission fluid
+
+create table public.eicu2preadio as
+(
+with t1 as
+(
+select distinct pt.patientunitstayid, intakeoutputoffset,
+case when cellpath like '%Intake%' then cellvaluenumeric else 0 end as pread_input,
+case when cellpath like '%Intake%' and cellpath like any ('{%0.2%,%.2ns%,%.2 ns%}') then cellvaluenumeric*0.25
+when cellpath like '%Intake%' and cellpath like any ('{%/50 meq nah%,%bicarbonate 50%}') then cellvaluenumeric *0.8
+when cellpath like '%Intake%' and cellpath like any ('{%150 meq nah%,%bicarbonate 150%}') then cellvaluenumeric *1.5
+when cellpath like '%Intake%' and cellpath like any ('{%.45%}') then cellvaluenumeric *0.5 -- needs to come after nah !
+when cellpath like '%Intake%' and cellpath like any ('{%3\%%,%mannitol%}') then cellvaluenumeric * 3
+when cellpath like '%Intake%' and cellpath like any ('{%25\%%}') then cellvaluenumeric * 5
+when cellpath like '%Intake%' then cellvaluenumeric else 0 end as pread_input_tev, 
+case when cellpath like '%Output%' then cellvaluenumeric else 0 end as pread_output,
+case when cellpath like '%Dialysis%' then cellvaluenumeric else 0 end as pread_dialysis -- many-most dialysis items are in output!!
+from public.cohort7 pt
+left outer join eicu.intakeoutput
+on pt.patientunitstayid=intakeoutput.patientunitstayid
+where cellpath in   (select cellpath from public.eicuiogoodlabels)
+and intakeoutputoffset < 0 
+)
+
+select distinct patientunitstayid, sum(pread_input) as pread_input, sum(pread_input_tev) as pread_input_tev, sum(pread_output + pread_dialysis) as pread_output, sum(pread_input - pread_output - pread_dialysis) as pread_fb, sum(pread_input_tev - pread_output - pread_dialysis) as pread_fb_tev
+from t1
+group by patientunitstayid
+);
+
+
+Real-time fluid
+
+
+create table public.eicu2io as
+(
+
+with t1 as
+(
+
+select distinct pt.patientunitstayid, intakeoutputoffset, floor(intakeoutputoffset/240)+1 as bloc,
+case when cellpath like '%Intake%' then cellvaluenumeric else 0 end as volinput,
+case when cellpath like '%Intake%' and cellpath like any ('{%0.2%,%.2ns%,%.2 ns%}') then cellvaluenumeric*0.25
+when cellpath like '%Intake%' and cellpath like any ('{%/50 meq nah%,%bicarbonate 50%}') then cellvaluenumeric *0.8
+when cellpath like '%Intake%' and cellpath like any ('{%150 meq nah%,%bicarbonate 150%}') then cellvaluenumeric *1.5
+when cellpath like '%Intake%' and cellpath like any ('{%.45%}') then cellvaluenumeric *0.5 -- needs to come after nah !
+when cellpath like '%Intake%' and cellpath like any ('{%3\%%,%mannitol%}') then cellvaluenumeric * 3
+when cellpath like '%Intake%' and cellpath like any ('{%25\%%}') then cellvaluenumeric * 5
+when cellpath like '%Intake%' then cellvaluenumeric else 0 end as volinput_tev,
+case when cellpath like '%Output%' then cellvaluenumeric else 0 end as voloutput,
+case when cellpath like '%Dialysis%' then cellvaluenumeric else 0 end as voldialysis -- cellvaluenumeric is always POSITIVE , DIALYSIStotal is NEGATIVE for fluid removal from RRT
+-- many items for dialysis are actually labelled 'OUTPUT' and not 'DIALYSIS'
+from public.cohort7 pt
+left outer join eicu.intakeoutput
+on pt.patientunitstayid=intakeoutput.patientunitstayid
+where cellpath in  (select cellpath from public.eicuiogoodlabels)
+and intakeoutputoffset between 0 and 432 0
+-- order by pt.patientunitstayid, intakeoutputoffset
+
+)
+
+select patientunitstayid, bloc, sum(volinput) as input_4hourly, sum(volinput_tev) as input_4hourly_tev, sum(voloutput + voldialysis) as output_4hourly, sum(volinput - voloutput - voldialysis) as fb_4hourly, sum(volinput_tev - voloutput - voldialysis) as fb_4hourly_tev
+from t1
+group by patientunitstayid, bloc
+
+
+);
+
+
+
+Vasopressors
+
+
+Create table public.eicu2vasoHIGH as
+(
+
+
+with pt as  -- list of patientIDs and (4h) blocs
+(
+
+select patientunitstayid, unnest(array[c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18]) as "bloc"
+from (
+select pt.patientunitstayid, 1 as c1,2 as c2,3 as c3,4 as c4, 5 as c5, 6 as c6, 7 as c7, 8 as c8, 9 as c9, 10 as c10, 11 as c11, 12 as c12,13 as c13, 14 as c14, 15 as c15, 16 as c16, 17 as c17, 18 as c18
+from public.cohort7 pt
+) as t
+
+
+), norepi as
+(
+
+select distinct patientunitstayid, infusionoffset, floor(infusionoffset/240)+1 as bloc,
+max(case when (lower(drugname) like '%ml/hr%' or lower(drugname) like '%()%'  ) then round(cast(drugrate as numeric)/150,3) -- rate in ml/h * 32 mcg/ml / 80 kg / 60 min, to convert in mcg/kg/min
+when lower(drugname) like '%mcg/min%' then round(cast(drugrate as numeric)/80 ,3)-- divide by 80 kg
+when lower(drugname) like '%mcg/kg/min%'  then cast(drugrate as numeric)
+else null end ) as norepi
+from eicu.infusiondrug id
+where lower(drugname) like '%norepinephrin%' and drugrate ~  '^[0-9.]{1,8}$' and drugrate<> '.' and drugrate<> '' and infusionoffset between 0 and 4320  -- this regex will capture norepi
+group by patientunitstayid, infusionoffset
+
+), epi as
+(
+
+select distinct patientunitstayid, infusionoffset, floor(infusionoffset/240)+1 as bloc,
+max(case when (lower(drugname) like '%ml/hr%'  or lower(drugname) like '%()%'  )   then round(cast(drugrate as numeric)/300,3) -- rate in ml/h * 16 mcg/ml / 80 kg / 60 min, to convert in mcg/kg/min
+when lower(drugname) like '%mcg/min%' then round(cast(drugrate as numeric)/80 ,3)-- divide by 80 kg
+when lower(drugname) like '%mcg/kg/min%'  then cast(drugrate as numeric)
+else null end ) as epi
+from eicu.infusiondrug id
+where lower(drugname) like 'epinephrin%' and drugrate ~  '^[0-9.]{1,8}$' and drugrate<> '.' and drugrate<>'' and infusionoffset between 0 and 4320  -- this regex will capture epi only
+group by patientunitstayid, infusionoffset
+
+
+
+), phenyl as
+(
+
+select distinct patientunitstayid, infusionoffset,  floor(infusionoffset/240)+1 as bloc,  -- most frequent concentration is 40 mg in 250 ml = 160 mcg/ml
+max(case when (lower(drugname) like '%ml/hr%'  or lower(drugname) like '%()%'  )  then round(cast(drugrate as numeric)/12,3) -- rate in ml/h * 400 mcg/ml / 80 kg / 60 min, to convert in mcg/kg/min
+when lower(drugname) like '%mcg/min%'   then round(cast(drugrate as numeric)/80 ,3)-- divide by 80 kg
+when lower(drugname) like '%mcg/kg/min%'  then cast(drugrate as numeric)
+else null end ) as phenyl
+from eicu.infusiondrug id
+where lower(drugname) like '%phenyl%' and drugrate ~  '^[0-9.]{1,8}$' and drugrate<> '.'  and drugrate<>'' and infusionoffset between 0 and 4320  -- this regex will capture norepi as well
+group by patientunitstayid, infusionoffset
+
+), vaso as
+(
+
+
+select distinct patientunitstayid, infusionoffset,  floor(infusionoffset/240)+1 as bloc,  
+max(case when (lower(drugname) like '%ml/hr%'  or lower(drugname) like '%()%'  )  then round(cast(drugrate as numeric)/60,3) -- rate in ml/h * 1 U/ml / 60 min, to convert in U/min
+when lower(drugname) like '%units/hr%'  then round(cast(drugrate as numeric)/60,3) -- / 60 min, to convert in U/min
+when lower(drugname) like '%units/min%'  then cast(drugrate as numeric)
+else null end ) as vaso
+from eicu.infusiondrug id
+where lower(drugname) like '%vasopressin%' and drugrate ~  '^[0-9.]{1,8}$' and drugrate<> '.' and drugrate<>''  and infusionoffset between 0 and 4320
+group by patientunitstayid, infusionoffset
+
+), dopa as
+(
+
+select distinct patientunitstayid, infusionoffset, floor(infusionoffset/240)+1 as bloc,
+max(case when (lower(drugname) like '%ml/hr%'  or lower(drugname) like '%()%'  )  then round(cast(drugrate as numeric)/1.5,3) -- rate in ml/h * 3200 mcg/ml / 80 kg / 60 min, to convert in mcg/kg/min
+when lower(drugname) like '%mcg/min%'  then round(cast(drugrate as numeric)/80 ,3)-- divide by 80 kg
+when lower(drugname) like '%mcg/kg/min%' then cast(drugrate as numeric)
+else null end ) as dopa  -- in mcg/kg/min
+from eicu.infusiondrug id
+where lower(drugname) like '%dopamin%' and drugrate ~  '^[0-9.]{1,8}$' and drugrate<> '.' and drugrate<>'' and infusionoffset between 0 and 4320
+group by patientunitstayid, infusionoffset
+
+)
+
+select pt.patientunitstayid, pt.bloc,
+max(norepi.norepi) as norepi, max(epi.epi) as epi, max(vaso.vaso) as vaso, max(phenyl.phenyl) as phenyl, max(dopa.dopa) as dopa,
+round(coalesce(max(norepi.norepi),0) + coalesce(max(epi.epi),0) + 5*coalesce(max(vaso.vaso),0) + 0.01*coalesce(max(dopa.dopa),0) + 0.45*coalesce(max(phenyl.phenyl),0),3) as maxvaso –-CORRECTION TO NOREPI-EQUIVALENT
+from pt
+left outer join norepi
+on pt.patientunitstayid=norepi.patientunitstayid and pt.bloc=norepi.bloc
+left outer join epi
+on pt.patientunitstayid=epi.patientunitstayid and pt.bloc=epi.bloc
+left outer join vaso
+on pt.patientunitstayid=vaso.patientunitstayid and pt.bloc=vaso.bloc
+left outer join phenyl
+on pt.patientunitstayid=phenyl.patientunitstayid and pt.bloc=phenyl.bloc
+left outer join dopa
+on pt.patientunitstayid=dopa.patientunitstayid and pt.bloc=dopa.bloc
+group by pt.patientunitstayid, pt.bloc
+
+);
+
+
+Combining everything
+
+-- version 02/02/17
+
+create table public.eicu2cohort as
+(
+with pt as  -- list of patientIDs and (4h) blocs
+(
+
+select patientunitstayid, bloc
+from(
+select patientunitstayid, unnest(array[c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18]) as "bloc", floor(unitdischargeoffset/240)+1 as discharge
+from (
+select pt.patientunitstayid, unitdischargeoffset, 1 as c1,2 as c2,3 as c3,4 as c4, 5 as c5, 6 as c6, 7 as c7, 8 as c8, 9 as c9, 10 as c10, 11 as c11, 12 as c12,13 as c13, 14 as c14, 15 as c15, 16 as c16, 17 as c17, 18 as c18
+from public.cohort7 pt
+)  as t1
+) as t2
+where bloc <= discharge  -- only keep blocs before ICU discharge!!
+),
+eicudemog as (Select * from public.eicu2demog),
+eicuvitals as(Select * from public.eicu2vitals), -- only HR, SpO2 and RR
+eicuvitalsbpnc as (select * from public.eicu2vitalsbpnc), -- vitals and BP from NC, to be used if missing
+eicubp as (Select * from public.eicu2bp),
+eicutempc as (Select * from public.eicu2tempc), -- in deg C
+eiculabs as (Select * from public.eicu2labs), -- real time labs
+eicuprelabs as ( Select * from public.eicu2prelabs),-- preadmission labs, to be used in bloc 1 if missing
+eicugcs1 as (Select * from public.eicu2gcs1), -- largest source of GCS values
+eicugcs2 as (Select * from public.eicu2gcs2), --  used if gcs1 is missing
+eicumechvent as (Select * from public.eicu2mechvent),  -- binary
+eicufio2mv as (Select * from public.eicu2fio2mv), -- fio2 is also taken from labs (ABG)
+eicupreadio as (Select * from public.eicu2preadio),  -- pread I/O
+eicuio as (Select * from public.eicu2ionomeds),   -- real time I/O
+eicuvaso as (Select * from public.eicu2vaso)
+
+-- ################   MERGING ALL SUBQUERIES HERE   ###################
+
+select distinct pt.patientunitstayid, pt.bloc,
+eicudemog.age, eicudemog.gender-1 as gender, eicudemog.admissionweight , eicudemog.hospitalid, -- eicudemog.apacheadmissiondx, 
+eicudemog.hospmortality,
+case when eicugcs1.gcs is not null then eicugcs1.gcs when eicugcs2.gcs is not null then eicugcs2.gcs else null end as gcs,
+
+case when eicuvitals.hr is not null then eicuvitals.hr when eicuvitalsbpnc.hr is not null then eicuvitalsbpnc.hr else null end as hr,
+case when eicuvitals.sao2 is not null then eicuvitals.sao2 when eicuvitalsbpnc.spo2 is not null then eicuvitalsbpnc.spo2 else null end as spo2,
+case when eicuvitals.rr is not null then eicuvitals.rr when eicuvitalsbpnc.rr is not null then eicuvitalsbpnc.rr else null end as rr,
+case when eicubp.sbp is not null then eicubp.sbp when eicuvitalsbpnc.sbp is not null then eicuvitalsbpnc.sbp else null end as sysbp,
+case when eicubp.dbp is not null then eicubp.dbp when eicuvitalsbpnc.dbp is not null then eicuvitalsbpnc.dbp else null end as diabp,
+case when eicubp.mbp is not null then eicubp.mbp when eicuvitalsbpnc.mbp is not null then eicuvitalsbpnc.mbp else null end as meanbp,
+-- , eicuvitals.sao2 as spo2, eicuvitals.rr, eicubp.sbp as sysbp, eicubp.dbp as diabp, eicubp.mbp as meanbp,
+
+eicutempc.tempc as temp_c,
+(case when eicubp.sbp is not null and eicuvitals.hr is not null then round(coalesce(eicuvitals.hr,0)/ coalesce(nullif(eicubp.sbp,0),120),2) 
+when eicubp.sbp is not null and eicuvitalsbpnc.hr is not null then  round(coalesce(eicuvitalsbpnc.hr,0)/ coalesce(nullif(eicubp.sbp,0),120),2) 
+when eicuvitalsbpnc.sbp is not null and eicuvitals.hr is not null then  round(coalesce(eicuvitals.hr,0)/ coalesce(nullif(eicuvitalsbpnc.sbp,0),120),2) 
+when eicuvitalsbpnc.sbp is not null and eicuvitalsbpnc.hr is not null then  round(coalesce(eicuvitalsbpnc.hr,0)/ coalesce(nullif(eicuvitalsbpnc.sbp,0),120),2) 
+else null end) as shock_index, 
+
+case when pt.bloc=1 and eiculabs.sodium is null then eicuprelabs.sodium when eiculabs.sodium is not null then eiculabs.sodium else null end as sodium,
+case when pt.bloc=1 and eiculabs.potassium is null then eicuprelabs.potassium when eiculabs.potassium is not null then eiculabs.potassium else null end as potassium,
+case when pt.bloc=1 and eiculabs.chloride is null then eicuprelabs.chloride when eiculabs.chloride is not null then eiculabs.chloride else null end as chloride,
+case when pt.bloc=1 and eiculabs.glucose is null then eicuprelabs.glucose when eiculabs.glucose is not null then eiculabs.glucose else null end as glucose,
+case when pt.bloc=1 and eiculabs.bun is null then eicuprelabs.bun when eiculabs.bun is not null then eiculabs.bun else null end as bun,
+case when pt.bloc=1 and eiculabs.creatinine is null then eicuprelabs.creatinine when eiculabs.creatinine is not null then eiculabs.creatinine else null end as creatinine,
+case when pt.bloc=1 and eiculabs.magnesium is null then eicuprelabs.magnesium when eiculabs.magnesium is not null then eiculabs.magnesium else null end as magnesium,
+case when pt.bloc=1 and eiculabs.calcium is null then eicuprelabs.calcium when eiculabs.calcium is not null then eiculabs.calcium else null end as calcium,
+case when pt.bloc=1 and eiculabs.bili is null then eicuprelabs.bili when eiculabs.bili is not null then eiculabs.bili else null end as total_bili,
+case when pt.bloc=1 and eiculabs.sgot is null then eicuprelabs.sgot when eiculabs.sgot is not null then eiculabs.sgot else null end as sgot,
+case when pt.bloc=1 and eiculabs.sgpt is null then eicuprelabs.sgpt when eiculabs.sgpt is not null then eiculabs.sgpt else null end as sgpt,
+case when pt.bloc=1 and eiculabs.albumin is null then eicuprelabs.albumin when eiculabs.albumin is not null then eiculabs.albumin else null end as albumin,
+case when pt.bloc=1 and eiculabs.hb is null then eicuprelabs.hb when eiculabs.hb is not null then eiculabs.hb else null end as hb,
+case when pt.bloc=1 and eiculabs.wbc is null then eicuprelabs.wbc when eiculabs.wbc is not null then eiculabs.wbc else null end as wbc_count,
+case when pt.bloc=1 and eiculabs.plt is null then eicuprelabs.plt when eiculabs.plt is not null then eiculabs.plt else null end as platelets_count,
+case when pt.bloc=1 and eiculabs.ptt is null then eicuprelabs.ptt when eiculabs.ptt is not null then eiculabs.ptt else null end as ptt,
+case when pt.bloc=1 and eiculabs.pt is null then eicuprelabs.pt when eiculabs.pt is not null then eiculabs.pt else null end as pt,
+case when pt.bloc=1 and eiculabs.inr is null then eicuprelabs.inr when eiculabs.inr is not null then eiculabs.inr else null end as inr,
+case when pt.bloc=1 and eiculabs.ph is null then eicuprelabs.ph when eiculabs.ph is not null then eiculabs.ph else null end as arterial_ph,
+case when pt.bloc=1 and eiculabs.pao2 is null then eicuprelabs.pao2 when eiculabs.pao2 is not null then eiculabs.pao2 else null end as pao2,
+case when pt.bloc=1 and eiculabs.paco2 is null then eicuprelabs.paco2 when eiculabs.paco2 is not null then eiculabs.paco2 else null end as paco2,
+(case when pt.bloc=1 and eiculabs.be is not null then eiculabs.be
+when pt.bloc=1 and eiculabs.bd is not null then -eiculabs.bd
+when pt.bloc=1 and eicuprelabs.be is not null then eicuprelabs.be
+when pt.bloc=1 and eicuprelabs.bd is not null then -eicuprelabs.bd
+when pt.bloc>1 and eiculabs.be is not null then eiculabs.be
+when pt.bloc>1 and eiculabs.bd is not null then -eiculabs.bd else null end ) as arterial_be,
+case when pt.bloc=1 and eiculabs.fio2 is null then eicuprelabs.fio2 when eiculabs.fio2 is not null then eiculabs.fio2 else null end as fio2abg,
+case when pt.bloc=1 and eiculabs.hco3 is null then eicuprelabs.hco3 when eiculabs.hco3 is not null then eiculabs.hco3 else null end as hco3,
+case when pt.bloc=1 and eiculabs.lactate is null then eicuprelabs.lactate when eiculabs.lactate is not null then eiculabs.lactate else null end as arterial_lactate,
+eicumechvent.mechvent, eicufio2mv.fio2 as fio2mv,
+case when eicufio2mv.fio2 is not null then eicufio2mv.fio2 when eiculabs.fio2 is not null then eiculabs.fio2 else null end as fio2both,
+eicuvaso.maxvaso as max_dose_vaso,
+eicupreadio.pread_input, eicupreadio.pread_output, eicupreadio.pread_fb, eicupreadio.pread_input_tev, eicupreadio.pread_fb_tev,
+eicuio.input_4hourly, eicuio.output_4hourly, eicuio.fb_4hourly, eicuio.input_4hourly_tev, eicuio.fb_4hourly_tev,
+case when pt.bloc=1 then coalesce(eicupreadio.pread_input + eicuio.input_4hourly, eicupreadio.pread_input, eicuio.input_4hourly) else eicuio.input_4hourly end as intakeinclpread,
+case when pt.bloc=1 then coalesce(eicupreadio.pread_input_tev + eicuio.input_4hourly_tev, eicupreadio.pread_input_tev, eicuio.input_4hourly_tev) else eicuio.input_4hourly_tev end as intakeinclpread_tev
+
+from pt
+left outer join eicudemog
+on pt.patientunitstayid=eicudemog.patientunitstayid
+left outer join eicugcs1
+on pt.patientunitstayid=eicugcs1.patientunitstayid and pt.bloc=eicugcs1.bloc
+left outer join eicugcs2
+on pt.patientunitstayid=eicugcs2.patientunitstayid and pt.bloc=eicugcs2.bloc
+left outer join eicuvitals
+on pt.patientunitstayid=eicuvitals.patientunitstayid and pt.bloc=eicuvitals.bloc
+left outer join eicuvitalsbpnc
+on pt.patientunitstayid=eicuvitalsbpnc.patientunitstayid and pt.bloc=eicuvitalsbpnc.bloc
+left outer join eicubp
+on pt.patientunitstayid=eicubp.patientunitstayid and pt.bloc=eicubp.bloc
+left outer join eicutempc
+on pt.patientunitstayid=eicutempc.patientunitstayid and pt.bloc=eicutempc.bloc
+left outer join eiculabs
+on pt.patientunitstayid=eiculabs.patientunitstayid and pt.bloc=eiculabs.bloc
+left outer join eicuprelabs
+on pt.patientunitstayid=eicuprelabs.patientunitstayid
+left outer join eicumechvent
+on pt.patientunitstayid=eicumechvent.patientunitstayid and pt.bloc=eicumechvent.bloc
+left outer join eicufio2mv
+on pt.patientunitstayid=eicufio2mv.patientunitstayid and pt.bloc=eicufio2mv.bloc
+left outer join eicupreadio -- as eicupread
+on pt.patientunitstayid=eicupreadio.patientunitstayid
+left outer join eicuio -- as eicuio
+on pt.patientunitstayid=eicuio.patientunitstayid and pt.bloc=eicuio.bloc
+left outer join eicuvaso
+on pt.patientunitstayid=eicuvaso.patientunitstayid and pt.bloc=eicuvaso.bloc
+order by pt.patientunitstayid, pt.bloc
+ );
+
