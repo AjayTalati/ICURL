@@ -1,0 +1,337 @@
+% BUILDS 500 MODELS
+% FILES I NEED
+% valid50 = n*64 table with raw values from eICU
+% Xtestraw =  RAW DATA m*47 array with columns in right order, matching Xz
+% Xtestzs =  ZSCORED m*47 array with columns in right order, matching Xz
+% reformat5t = n*62 table with raw values from MIMIC
+ 
+% ############################  PARAMETERS   #####################################
+ncl=750;
+nclustering=40;% how many times we do clustering (best solution will be chosen)
+nr_reps=500;   % nr of repetitions (nr_reps * 5 = nr models total)
+gammas=[0.01 0.1:0.1:0.9 0.99];    % ######################### GAMMA DEFINITION  ####################################
+t=1;   % increase this number to test less = accelerate the process. if t=2, I only test half of the test set. 1/10 = 10% of the data is tested for each model, with full eICU DB
+nra=5; %# of actions (2 to 10)
+ 
+if size(valid50,1)~= size(Xtestraw,1)
+    disp('Check valide and Xtest'); disp('EXECUTION STOPPED'); return
+end
+ 
+if sum(isnan(Xtestraw(:,4))) >0 | sum(isnan(Xtestraw(:,45)))>0
+    disp('NaNs in Xtest / drug doses'); disp('EXECUTION STOPPED'); return
+end
+
+p=gcp('nocreate');
+if isempty(p)
+pool = parpool;                      % Invokes workers
+end
+ 
+stream = RandStream('mlfg6331_64');  % Random number stream
+options = statset('UseParallel',1,'UseSubstreams',1,'Streams',stream);
+warning('off','all')
+ncv=5; %nr of CV runs (each is 80% training / 20% test)
+icustayidlist=reformat5t.icustayid;
+icuuniqueids=unique(icustayidlist);
+reformat5=table2array(reformat5t);
+V_max=0;   %record max value of optimal policy
+prop=0.5; %proportion of the data we sample for clustering
+mdp_verbose
+Y90test=valid50.hospmortality;   
+jtest=1;  %count for rectest
+modl=1;  %count of models
+jprog=1;%  
+a=floor(1/t*size(Xz,1)*nr_reps*5*1.25);  % total nr test records + safety margin  
+idxs=zeros(size(Xtestraw,1),nr_reps); %record state membership test cohort
+OA=NaN(752,nr_reps);  %record optimal actions
+recqvi=zeros(nr_reps*6,8);  %1 row per model
+
+% create normalised dataset for model training (with no test sample inside)
+ 
+colbin = {'gender','mechvent','max_dose_vaso','re_admission'};  %will simply substract 0.5 to center around 0
+colnorm={'age','Weight_kg','GCS','HR','SysBP','MeanBP','DiaBP','RR','Temp_C','FiO2_1',...
+    'Potassium','Sodium','Chloride','Glucose','Magnesium','Calcium',...
+    'Hb','WBC_count','Platelets_count','PTT','PT','Arterial_pH','paO2','paCO2',...
+    'Arterial_BE','HCO3','Arterial_lactate','SOFA','SIRS','Shock_Index','PaO2_FiO2','cumulated_balance_tev'};
+collog={'SpO2','BUN','Creatinine','SGOT','SGPT','Total_bili','INR','input_total_tev','input_4hourly_tev','output_total','output_4hourly'};
+ 
+colbin=find(ismember(reformat5t.Properties.VariableNames,colbin));
+colnorm=find(ismember(reformat5t.Properties.VariableNames,colnorm));
+collog=find(ismember(reformat5t.Properties.VariableNames,collog));
+ 
+Xx=[reformat5(:, colbin)-0.5 zscore(reformat5(:,colnorm)) zscore(log(0.1+reformat5(:, collog)))];  
+    Xx(:,[4])=log(Xx(:,[ 4])+.6);  % added 280117
+    Xx(:,[45])=2.*Xx(:,[ 45]);   % increase weight of these variables!
+ 
+  N=numel(icuuniqueids); %tot number of rows to choose from
+  grp=floor(ncv*rand(N,1)+1);  %list of 1 to 5 (20% of the data in each grp)
+  crossval=1;
+  trainidx=icuuniqueids(crossval~=grp);
+  testidx=icuuniqueids(crossval==grp);
+  train=ismember(icustayidlist,trainidx);
+  test=ismember(icustayidlist,testidx);
+  blocs=reformat5(train,1);
+  Yh=reformat5(train,10); 
+  Y90=reformat5(train,8);    %   HOSP _ MORTALITY = 8 / 90d MORTA = 10
+  X=Xx(train,:);
+ 
+  Qsumoff_max=cell(nr_reps,1);%,752,25);
+  Qsumon_max=cell(nr_reps,1);%,752,25);
+    
+  
+for rep=1:nr_reps  % repetition
+ 
+       fprintf('##############   Model number : ');
+       fprintf('%d \n',modl);  
+       disp( datestr(now))
+          
+ 
+% #######   find best clustering solution (lowest intracluster variability)  ####################
+disp('####  CLUSTERING  ####') % BY SAMPLING !
+tic
+N=size(X,1); %total number of rows to choose from
+sampl=X(find(floor(rand(N,1)+prop)),:);
+ 
+[~,C] = kmeans(sampl,ncl,'Options',options,'MaxIter',10000,...
+    'Start','plus','Display','final','Replicates',nclustering);
+[idx]=fastknnsearch(X,C,1);  %N-D nearest point search: look for points closest to each centroid
+toc   
+ 
+%  ############################# CREATE ACTIONS  ########################
+disp('####  CREATE ACTIONS  ####') 
+nact=nra^2;
+ 
+iol=find(ismember(reformat5t.Properties.VariableNames,{'input_4hourly_tev'}));
+vcl=find(ismember(reformat5t.Properties.VariableNames,{'max_dose_vaso'}));
+ 
+ a= reformat5(:,iol);                   %IV fluid
+ a= tiedrank(a(a>0)) / length(a(a>0));   % excludes zero fluid (will be action 1)
+ 
+        iof=floor((a+0.2499999999)*4);  %converts iv volume in 4 actions
+        a= reformat5(:,iol); a=find(a>0);  %location of non-zero fluid in big matrix
+        io=ones(size(reformat5,1),1);  %array of ones, by default     
+        io(a)=iof+1;   %where more than zero fluid given: save actual action
+        vc=reformat5(:,vcl);  vcr= tiedrank(vc(vc~=0)) / numel(vc(vc~=0)); vcr=floor((vcr+0.249999999999)*4);  %converts to 4 bins
+        vcr(vcr==0)=1; vc(vc~=0)=vcr+1; vc(vc==0)=1;
+        ma1=[ median(reformat5(io==1,iol))  median(reformat5(io==2,iol))  median(reformat5(io==3,iol))  median(reformat5(io==4,iol))  median(reformat5(io==5,iol))];  %median dose of drug in all bins
+        ma2=[ median(reformat5(vc==1,vcl))  median(reformat5(vc==2,vcl))  median(reformat5(vc==3,vcl))  median(reformat5(vc==4,vcl))  median(reformat5(vc==5,vcl))] ;
+  
+med=[io vc];
+[uniqueValues,~,actionbloc] = unique(array2table(med),'rows');
+actionbloctrain=actionbloc(train);
+% actionbloctest=actionbloc(test);
+uniqueValuesdose=[ ma2(uniqueValues.med2)' ma1(uniqueValues.med1)'];  % median dose of each bin for all 25 actions
+ 
+% find max doses per bin
+iol=find(ismember(reformat5t.Properties.VariableNames,{'input_4hourly_tev'}));
+vcl=find(ismember(reformat5t.Properties.VariableNames,{'max_dose_vaso'}));
+ma1=[ max(reformat5(io==1,iol))  max(reformat5(io==2,iol))  max(reformat5(io==3,iol))  max(reformat5(io==4,iol))  max(reformat5(io==5,iol))];  %median dose of drug in all bins
+ma2=[ max(reformat5(vc==1,vcl))  max(reformat5(vc==2,vcl))  max(reformat5(vc==3,vcl))  max(reformat5(vc==4,vcl))  max(reformat5(vc==5,vcl))] ;
+ 
+% define actionbloctest = which actions are taken in the test set ????
+vct=Xtestraw(:,4); vct(vct>ma2(nra-1))=nra; vct(vct==0)=1; for z=2:nra-1; vct(vct>ma2(z-1) & vct<=ma2(z))=z;end
+iot=Xtestraw(:,45); for z=2:nra-1; iot(iot>ma1(z-1) & iot<=ma1(z))=z; end;iot(iot>ma1(nra-1))=nra;iot(iot==0)=1;
+ 
+med=[iot vct];
+[~,~,actionbloctest] = unique(array2table(med),'rows');   %actions taken in my test samples
+ 
+iol=Xtestraw(:,45);      % DOSES IN TEST SET
+vcl=Xtestraw(:,4);
+ 
+ 
+% ###################################################################################################################################
+disp('####  CREATE QLDATA3  ####')
+ 
+%simple reward defintion 24 12 16
+r=[100 -100];
+r2=r.*(2*(1-Y90)-1); 
+qldata=[blocs idx actionbloctrain Y90 r2];  % contains bloc / state / action / outcome&reward     %1 = died
+qldata3=zeros(size(qldata,1),4); 
+c=0;
+abss=[ncl+2 ncl+1]; %absorbing states numbers
+ 
+        for i=1:size(qldata,1)-1
+            c=c+1;
+              qldata3(c,:)=qldata(i,1:4);
+            if qldata(i+1,1)==1 %end of trace for this patient
+                c=c+1;
+                qldata3(c,:)=[qldata(i,1)+1 abss(1+qldata(i,4)) 0 qldata(i,5)]; 
+            end
+        end
+ 
+ 
+% ###################################################################################################################################
+disp('####  CREATE TRANSITION MATRIX T(S'',S,A) ####')
+ 
+transitionr=zeros(ncl+2,ncl+2,nact);  %this is T(S',S,A)
+sums0a0=zeros(ncl+2,nact);
+ 
+     for i=1:size(qldata3,1)-1
+ 
+         if (qldata3(i+1,1))~=1  % if we are not in the last state for this patient = if there is a transition to make!
+         S0=qldata3(i,2);
+         S1=qldata3(i+1,2);   
+         acid= qldata3(i,3);
+         transitionr(S1,S0,acid)=transitionr(S1,S0,acid)+1;
+         sums0a0(S0,acid)=sums0a0(S0,acid)+1;
+         end
+     end
+ 
+     for i=1:ncl+2
+         for j=1:nact
+           transitionr(:,i,j)=transitionr(:,i,j)/sums0a0(i,j);
+         end
+     end
+ 
+transitionr(isnan(transitionr))=0;  %replace NANs with zeros
+ 
+physpol=sums0a0./sum(sums0a0')';    %physicians policy: what action was chosen in each state
+ 
+ disp('####  CREATE TRANSITION MATRIX T(S,S'',A)  ####')
+ 
+transitionr2=zeros(ncl+2,ncl+2,nact);  % this is T(S,S',A)
+sums0a0=zeros(ncl+2,nact);
+ 
+     for i=1:size(qldata3,1)-1
+ 
+         if (qldata3(i+1,1))~=1  % if we are not in the last state for this patient = if there is a transition to make!
+         S0=qldata3(i,2);
+         S1=qldata3(i+1,2);   
+         acid= qldata3(i,3);
+         transitionr2(S0,S1,acid)=transitionr2(S0,S1,acid)+1;
+         sums0a0(S0,acid)=sums0a0(S0,acid)+1;
+         end
+     end
+ 
+     for i=1:ncl+2
+         for j=1:nact
+           transitionr2(i,:,j)=transitionr2(i,:,j)/sums0a0(i,j);
+         end
+     end
+ 
+transitionr2(isnan(transitionr2))=0;  %replace NANs with zeros
+ 
+ 
+% #################################################################################################################################
+disp('####  CREATE REWARD MATRIX  R(S,A) ####')
+% CF sutton& barto bottom of page 106. i compute R(S,A) from R(S'SA) and T(S'SA)
+r3=zeros(ncl+2,ncl+2,nact); r3(ncl+1,:,:)=-100; r3(ncl+2,:,:)=100;
+R=sum(transitionr.*r3);
+R=squeeze(R);   %remove 1 unused dimension
+
+% ###################################################################################################################################
+ 
+%  OFFLINE SARSA / GAMMA MARGINALIZED
+disp('####  OFFLINE SARSA  ####') 
+ 
+Qsumoff=zeros(ncl+2,nact);
+Qoffcell=cell(1,numel(gammas));  %cell array used to save output of all sub-calculations
+ 
+        parfor g=1:numel(gammas)
+        gamma=gammas(g);
+        fprintf('   gamma : ');
+        fprintf('%f \n',gamma);      
+        
+        [Qoff, sumQ]=OffpolicyQlearning150816( qldata3 , gamma, 0.1, 500000);
+        Qoffcell(g)={Qoff};  %saving the Q value into cell array
+ 
+        end
+        
+  for g=1:numel(gammas)
+   gamma=gammas(g);   
+   Qoff=cell2mat(Qoffcell(g));  %recovering the x*x double from the cell array
+       
+            for i=1:ncl
+            Qsumoff(i,:)=Qsumoff(i,:)+Qoff(i,:)*(1-gamma);% with normalizing
+            end
+  end
+  
+Qsumoff=100*Qsumoff./max(max(Qsumoff));   %normalize with max = +100 pts
+ 
+%mean state-value function of physicians
+Vs=sum((physpol.*Qsumoff)')';
+Vact=nanmean(Vs); 
+Vact_med=nanmedian(Vs); 
+
+%  DP / GAMMA MARGINALIZED
+disp('####   POLICY ITERATION   ####')
+ 
+Qsumon=zeros(ncl+2,nact);   %only used to find optimal actions
+Qoncell=cell(1,numel(gammas));
+ 
+         parfor g=1:numel(gammas)
+            
+        gamma=gammas(g);
+        fprintf('   gamma : ');
+        fprintf('%f \n',gamma);
+                
+        [~,~,~,~,Qon] = mdp_policy_iteration_with_Q(transitionr2, R, gamma, ones(ncl+2,1));
+      
+        Qoncell(g)={Qon};
+         end 
+ 
+ for g=1:numel(gammas)
+   gamma=gammas(g);   
+   Qon=cell2mat(Qoncell(g));  %recovering the x*x double from the cell array
+   
+             for i=1:ncl
+             Qsumon(i,:)=Qsumon(i,:)+Qon(i,:)*(1-gamma); %with normalizing
+             end
+ end
+ 
+ [~,OptimalAction]=max(Qsumon,[],2);  %deterministic
+ 
+ OA(:,modl)=OptimalAction; %save optimal actions
+   
+ pol=zeros(ncl+2,nact);  %optimal policy
+ for i=1:ncl+2
+     pol(i,OptimalAction(i))=1;
+ end
+ 
+% compute the mean state value function for this model
+  Qsumon_norm=100*Qsumon./max(max(Qsumon));   %normalize with max = +100 pts
+  
+  Vopt_off=nanmean(sum((pol.*Qsumoff)')'); 
+  Vs=sum((pol.*Qsumon_norm)')';
+  Vopt_on=nanmean(sum((pol.*Qsumon_norm)')'); 
+  Vopt_off_med=nanmedian(sum((pol.*Qsumoff)')'); 
+  Vopt_on_med=nanmedian(sum((pol.*Qsumon_norm)')'); 
+ 
+ 
+recqvi(modl,1)=ncl;
+recqvi(modl,2)=nra;
+recqvi(modl,3)=Vact;  %mean state-value function, for optimal policy
+recqvi(modl,4)=Vopt_off;  %mean state-value function, for optimal policy
+recqvi(modl,5)=Vopt_on;  %mean state-value function, for optimal policy
+recqvi(modl,6)=Vact_med;  %mean state-value function, for optimal policy
+recqvi(modl,7)=Vopt_off_med;  %median state-value function, for optimal policy IN MIMIC!!
+recqvi(modl,8)=Vopt_on_med;  %median state-value function, for optimal policy IN MIMIC!!
+ 
+    Qsumoff_max{modl}=Qsumoff;
+    Qsumon_max{modl}=Qsumon_norm; 
+    
+ 
+        disp('####   FINDING STATE MEMBERSHIP OF TEST RECORDS   ####' )  
+ 
+        idxtest=cell(size(Xtestzs,1),1);
+        ii=isnan(Xtestzs);
+        tic
+        parfor i=1:size(Xtestzs,1)
+        idxtest(i)={fastknnsearch(Xtestzs(i,~ii(i,:)),C(:,~ii(i,:)),1)};  %which ones are the k closest records in Xtrain? - only match on available data (ii columns)!
+        end
+ 
+        toc
+ 
+        % save state membership of this model
+        idxs(:,modl)=cell2mat(idxtest);
+
+modl=modl+1;  %increment count of models
+ 
+toc
+ 
+ 
+end
+recqvi(modl:end,:)=[];
+
+
+%% CHOOSE BEST CLUSTERING SOLUTION  = MAX V VALUE among all candidates
+bestpol=find(recqvi(:,8)==max(recqvi(:,8)))  %which one is best?
