@@ -231,7 +231,7 @@ Qoffcell=cell(1,numel(gammas));  %cell array used to save output of all sub-calc
         fprintf('   gamma : ');
         fprintf('%f \n',gamma);      
         
-        [Qoff, sumQ]=OffpolicyQlearning150816( qldata3 , gamma, 0.1, 500000);
+        [Qoff, sumQ]=OffpolicyQlearning( qldata3 , gamma, 0.1, 500000);
         Qoffcell(g)={Qoff};  %saving the Q value into cell array
  
         end
