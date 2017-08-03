@@ -1,0 +1,58 @@
+ 
+%% TESTS BEST POLICY ON eICU
+ 
+t=1;  % on full eicu
+jtest=1;  %count for rectest
+N=size(Xtestraw,1);
+a=floor(1/t*N*1.25);  % total nr test records + safety margin
+rectest=zeros(a,16);  %actual Q + dose / reco Q + dose / outcome
+iol=Xtestraw(:,45);      % DOSES IN TEST SET
+vcl=Xtestraw(:,4);
+pol=bestpol  % nr of best pol found in recqvi
+          
+h = waitbar(0,'Initializing waitbar...');
+x=clock;
+OptimalAction=OA(:,pol);
+idxtest=idxs(:,pol);   %state of records from training set
+Qsumoff_max1=Qsumoff_max{pol};
+Qsumon_max1=Qsumon_max{pol};
+models=OptimalAction(idxtest);              %optimal action for each record
+modeldosevaso = uniqueValuesdose(models,1);    %dose reco in this model
+modeldosefluid = uniqueValuesdose(models,2);   %dose reco in this model
+ 
+    for it=1:N/t
+            
+            if mod(it,10000)==0
+             h=waitbar(it/(N/t),h,[num2str(it/(N/t)*100) '% - ' num2str(floor(etime(clock,x)/(it/(N/t))-etime(clock,x))) ' seconds remaining'] );
+             set(h,'Name','Testing in progress');
+            end
+             
+        rectest(jtest,1)=modl;
+        rectest(jtest,2)= Qsumoff_max1(idxtest(it),actionbloctest(it));    %Q value of actual action //// KNN = 5 !!!!!
+        rectest(jtest,3)= Qsumoff_max1(idxtest(it),OptimalAction(idxtest(it))); % Q value of reco action    //// KNN = 5 !!!!
+        rectest(jtest,4)=vcl(it); %actual dose of vaso
+        rectest(jtest,5)=modeldosevaso(it);%reco dose of vaso
+        rectest(jtest,6)=iol(it);%actual dose of ivfluid
+        rectest(jtest,7)=modeldosefluid(it);%reco dose of iv fluid
+        rectest(jtest,8)= Y90test(it);
+        
+        rectest(jtest,11)=nra;
+        rectest(jtest,12)=ncl;
+        rectest(jtest,13)=Qsumon_max1(idxtest(it),OptimalAction(idxtest(it))); % Q value of reco action on Q_ON   //// KNN = 5 !!!!
+        rectest(jtest,14)=validnan.patientunitstayid(it);   %save pt id, for analyis at the patient level
+        rectest(jtest,15)=validnan.hospitalid(it);   %save pt id, for analyis at the patient level
+        rectest(jtest,16)=validnan.bloc(it);   %save pt id, for analyis at the patient level
+ 
+        jtest=jtest+1;
+        
+        
+        
+     end
+        
+close(h)
+rectest(jtest:end,:)=[];
+ 
+% given  minus reco  
+rectest(:,9)= rectest(:,4)- rectest(:,5);  %VASOPRESSORS
+rectest(:,10)= rectest(:,6)- rectest(:,7);  %FLUIDS
+ 
